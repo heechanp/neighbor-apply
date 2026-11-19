@@ -23,10 +23,13 @@ const keyOf = (it) => `a:${ME_ID}:${it.blogId}`;
 // 네이버 알림 문구 판정 (처음 몇 번 실제 문구를 보고 고친다)
 const LIMIT_RE = /(하루|1일|일일|오늘).{0,30}(신청|추가).{0,30}(초과|제한|한도|최대|없습니다|수\s*있)|(신청|추가).{0,20}(초과|한도|제한)|더\s*이상.{0,20}(신청|추가)/;
 const CAPTCHA_RE = /자동\s*입력\s*방지|보안\s*문자|captcha/i;
-const ALREADY_RE = /이미.{0,20}(이웃|신청|서로이웃)|신청\s*중|수락\s*대기/;
+const ALREADY_RE = /이미.{0,20}(이웃|신청|서로이웃)|신청\s*(진행\s*)?중|수락\s*대기/;
+// 2026-11-19 확인: 신청이 되면 알림 없이 그대로 있고, 신청 화면을 다시 열면 이 문구가 나온다
+const PENDING_RE = /서로이웃\s*신청\s*진행\s*중/;
 const NOBOTH_RE = /서로이웃.{0,20}(받지|허용하지|불가|할 수 없)/;
 const SELF_RE = /나\s*자신/;
 const OK_RE = /(신청|추가).{0,15}(되었|됐|완료|보냈|하였)|(보냈습니다|완료되었습니다)/;
+const GROUP_FULL_RE = /그룹.{0,30}(초과|가득|꽉|최대|더\s*이상|인원)/;
 
 let page = null;
 const ev = (fn, arg) => page.mainFrame().evaluate(fn, arg);
@@ -85,7 +88,11 @@ const applyOne = async (it) => {
   const g = await ev((name) => {
     const s = document.querySelector('#buddyGroupSelect'); if (!s) return 'nogroup';
     const opts = [...s.options];
-    const o = opts.find((o) => o.text.trim() === name) || opts[opts.length - 1];
+    // '<이름>', '<이름> 2', '<이름> 3' … 중 번호가 가장 큰 그룹(꽉 차서 새로 만든 그룹)을 쓴다
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp('^' + esc + '(?: (\\d+))?$');
+    const cand = opts.map((o) => [o, re.exec(o.text.trim())]).filter((x) => x[1]).sort((a, b) => (+(a[1][1] || 1)) - (+(b[1][1] || 1)));
+    const o = cand.length ? cand[cand.length - 1][0] : opts[opts.length - 1];
     if (!o) return 'nogroup';
     s.value = o.value; s.dispatchEvent(new Event('change', { bubbles: true }));
     return o.text.trim();
@@ -109,16 +116,43 @@ const applyOne = async (it) => {
     const a = await alertText(); if (a) return a;
     if (!/BuddyAddForm/.test(page.url())) return 'URL ' + page.url();
     return null;
-  }, 8000);
+  }, 5000);
   await wait(500);
-  const post = ((after || '') + ' ' + (await alertText())).trim();
+  let post = ((after || '') + ' ' + (await alertText())).trim();
+  if (!after) {
+    // 알림이 없으면 신청 화면을 다시 열어 '신청 진행중'인지 본다
+    await page.goto(`https://m.blog.naver.com/BuddyAddForm.naver?blogId=${it.blogId}`);
+    await until(() => ev(() => (document.body ? document.body.innerText : '').length > 20), 8000);
+    await wait(800);
+    const t = await bodyText();
+    if (PENDING_RE.test(t)) return { ...r, status: 'ok', msg: '신청 진행중 확인' };
+    post = t;
+  }
   r.msg = post.slice(0, 150) || '(알림 없음)';
-  if (CAPTCHA_RE.test(post) || LIMIT_RE.test(post)) r.status = 'limit';
+  if (GROUP_FULL_RE.test(post)) r.status = 'group_full';
+  else if (CAPTCHA_RE.test(post) || LIMIT_RE.test(post)) r.status = 'limit';
   else if (ALREADY_RE.test(post)) r.status = 'skip_already';
   else if (NOBOTH_RE.test(post)) r.status = 'skip_noboth';
   else if (OK_RE.test(post) || /^URL /.test(after || '')) r.status = 'ok';
-  else r.status = after ? 'unknown' : 'fail';
+  else r.status = 'unknown';
   return r;
+};
+
+// 그룹이 꽉 차면 관리 화면에서 새 그룹('<기본그룹 이름> 2', 3 …)을 만든다 (2026-11-19 사용자: 꽉 차면 새 그룹 만들어 이어서)
+const addGroup = async () => {
+  await page.goto(`https://admin.blog.naver.com/BuddyGroupManage.naver?blogId=${ME_ID}`);
+  await until(() => ev(() => !!document.querySelector('#addGroupForm input[name="name"]')), 12000);
+  const names = await ev(() => document.body.innerText);
+  let n = 2; while (names.includes(`${GROUP} ${n}`)) n++;
+  const name = `${GROUP} ${n}`;
+  await ev(() => { const s = document.createElement('script'); s.textContent = "window.alert=function(){return true};window.confirm=function(){return true};"; document.head.appendChild(s); });
+  await ev((name) => { const f = document.querySelector('#addGroupForm'); f.querySelector('input[name="name"]').onfocus = null; f.querySelector('input[name="name"]').value = name; f.submit(); }, name);
+  await wait(3000);
+  await page.goto(`https://admin.blog.naver.com/BuddyGroupManage.naver?blogId=${ME_ID}`);
+  await wait(2000);
+  const ok = (await ev(() => document.body.innerText)).includes(name);
+  log(`새 그룹 ${name} ${ok ? '만듦' : '못 만듦'}`);
+  return ok ? name : null;
 };
 
 try {
@@ -132,7 +166,12 @@ try {
     let limit = null, n = 0;
     for (const it of todo) {
       if (sec() > TIME_BUDGET) break;
-      const r = await applyOne(it);
+      let r = await applyOne(it);
+      if (r.status === 'group_full') {
+        const g = await addGroup();
+        if (!g) { r.status = 'limit'; r.msg = '그룹이 꽉 찼는데 새 그룹을 못 만듦: ' + r.msg; }
+        else { console.log('APPLY_NEW_GROUP ' + g); r = await applyOne(it); }
+      }
       out.results.push(r);
       log(`${it.blogId} ${r.status} ${r.msg}`);
       if (r.status === 'limit') { limit = r.msg; break; }

@@ -24,7 +24,11 @@ UA_PC = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, li
 UA_M = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148'
 MY_IDS = {'qlgovl_', 'heechan0688'}
 BIZ = re.compile(r'부동산|세무|법무|변호|보청기|의원|병원|한의원|치과|인테리어|청소|누수|대출|사채|요양|컴퍼니|센터|공인중개|보험|렌탈|분양|마케팅|광고|학원|코칭|상담|에어컨|이사|철거|시공|설비|리딩|투자자문|코인방|주식방|공식|official', re.I)
-DROP_LINE = re.compile(r'주소|영업\s*시간|전화|주차|협찬|원고료|제공받|#|https?://|^\s*$')
+# 쇼핑 제휴(가격 나열) 글, 업체 연락처 글 (2026-11-19: 검색 결과에 많이 섞여 있어 거름)
+SHOP = re.compile(r'￦\s*[\d,]+원|([\d,]{4,}원)\s+\1|바로가기|구매\s*링크|파트너스|수수료를 제공|010-\d{3,4}-\d{4}|문의\s*(및|는)?\s*상담')
+# 닉네임이 영어+숫자 뒤섞인 아이디 그대로인 계정(자동 생성 블로그가 많음)
+RANDOM_NICK = re.compile(r'^(?=.*\d)[a-z0-9]{8,}$')
+DROP_LINE =re.compile(r'주소|영업\s*시간|전화|주차|협찬|원고료|제공받|#|https?://|^\s*$')
 
 
 def get(url, ua, ref=None, tries=3):
@@ -59,6 +63,8 @@ def body(blog_id, log_no):
         return ''
     paras = re.findall(r'<p class="se-text-paragraph[^"]*"[^>]*>(.*?)</p>', t, re.S)
     lines = [strip_tags(p).replace('​', '') for p in paras]
+    if SHOP.search('\n'.join(lines)):
+        return 'SHOP'
     lines = [l for l in lines if l and not DROP_LINE.search(l)]
     text = '\n'.join(lines)
     if len(text) > 900:
@@ -85,12 +91,15 @@ def main():
     ap.add_argument('--order', default='recentdate')
     ap.add_argument('--keep-biz', action='store_true')
     ap.add_argument('--out', required=True)
+    ap.add_argument('--exclude', default='', help='이번에 뺄 블로그 ID(쉼표로)')
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     done = history(out)
     seen = set(MY_IDS)
-    skipped = {'예전에 처리함': 0, '업체·홍보 이름': 0, '본문 없음': 0}
+    skipped = {'예전에 처리함': 0, '업체·홍보 이름': 0, '자동 계정 같음': 0, '쇼핑·업체 홍보글': 0, '본문 없음': 0}
+    if a.exclude:
+        seen |= set(a.exclude.split(','))
     picked = []
     per_kw = -(-a.count // len(a.keyword))
     for kw in a.keyword:
@@ -109,6 +118,9 @@ def main():
                     skipped['예전에 처리함'] += 1
                     continue
                 nick, bname = r.get('nickName') or '', r.get('blogName') or ''
+                if RANDOM_NICK.match(nick) or (nick == bid and re.search(r'\d{3,}', bid)):
+                    skipped['자동 계정 같음'] += 1
+                    continue
                 if not a.keep_biz and (BIZ.search(nick) or BIZ.search(bname)):
                     skipped['업체·홍보 이름'] += 1
                     continue
@@ -121,6 +133,9 @@ def main():
             for c, t in zip(cands, texts):
                 if got >= per_kw:
                     break
+                if t == 'SHOP':
+                    skipped['쇼핑·업체 홍보글'] += 1
+                    continue
                 c['text'] = t or c['summary']
                 if len(c['text']) < 60:
                     skipped['본문 없음'] += 1
