@@ -120,13 +120,16 @@ const applyOne = async (it) => {
   await wait(500);
   let post = ((after || '') + ' ' + (await alertText())).trim();
   if (!after) {
-    // 알림이 없으면 신청 화면을 다시 열어 '신청 진행중'인지 본다
-    await page.goto(`https://m.blog.naver.com/BuddyAddForm.naver?blogId=${it.blogId}`);
-    await until(() => ev(() => (document.body ? document.body.innerText : '').length > 20), 8000);
-    await wait(800);
-    const t = await bodyText();
-    if (PENDING_RE.test(t)) return { ...r, status: 'ok', msg: '신청 진행중 확인' };
-    post = t;
+    // 알림이 없으면 '보낸신청' 목록에 그 사람이 있는지 본다.
+    // (신청 화면을 다시 열면 "신청 진행중입니다. 취소하시겠습니까?" 창이 떠서 쓰지 않는다 — 2026-11-20 사용자)
+    await page.goto(`https://admin.blog.naver.com/BuddyInviteSentManage.naver?blogId=${ME_ID}`);
+    const listed = await until(() => ev((id) => {
+      const t = document.body ? document.body.innerText : '';
+      if (!/보낸신청/.test(t)) return null;
+      return new RegExp('(^|\\s)' + id.replace(/[-]/g, '\\-') + '(\\s|$)').test(t) ? 'yes' : 'no';
+    }, it.blogId), 8000);
+    if (listed === 'yes') return { ...r, status: 'ok', msg: '보낸신청 목록에서 확인' };
+    post = '보낸신청 목록에 없음';
   }
   r.msg = post.slice(0, 150) || '(알림 없음)';
   if (GROUP_FULL_RE.test(post)) r.status = 'group_full';
